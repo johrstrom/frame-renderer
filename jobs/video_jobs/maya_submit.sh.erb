@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 #set the resources requests. Job name, time, nodes and cores per task, task count 
 
@@ -12,62 +12,118 @@ BIND_DIRS="$JOB_TMPDIR:/tmp"
 # set a new tmpdir bc that's what the container needs to look at
 export TMPDIR="/tmp"
 
-function create_thumbnails(){
-  RESIZE="-resize 80x80"
-  #IMG_EXTRA_ARGS="-auto-gamma"
-  IMG_ARGS="$RESIZE $IMG_EXTRA_ARGS"
+UTIL_FILE="$JOB_TMPDIR/utils.rb"
 
-  IMG_DIR="<%= project_dir %>/images"
-  THUMB_DIR="<%= project_dir %>/thumbnails"
+cat > "$UTIL_FILE" <<UTILS
+#!/usr/bin/env ruby
 
-  mkdir $THUMB_DIR 2>/dev/null
+def output_start_frame
+  puts task_start_frame
+end
 
-  for IMG in $(ls <%= project_dir %>/images 2>/dev/null)
-  do
-    BASE_IMG_NAME=${IMG##*/}
-    IMG_NAME=${BASE_IMG_NAME%.*}
-
-    convert $IMG_DIR/$IMG $IMG_ARGS $THUMB_DIR/$IMG_NAME.png
-  done
-}
-
-function start_frame(){
-  if [ -z "$PBS_ARRAYID" ]; then
-    PBS_ARRAYID=1
-  fi
-  
-  if [ $PBS_ARRAYID -gt 1 ]; then
-    # if nodes >1 have to offset +1 so the start frame of this task
-    # doesn't overlap with the end frame of the previous task
-    TASK_START_FRAME=$(( OFFSET - TASK_SIZE + START_FRAME + 1 ))
-  elif [ "$NODES" != "1" ]; then
-    TASK_START_FRAME=$(( OFFSET - TASK_SIZE + START_FRAME ))
+def task_start_frame
+  if nodes == 1
+    start_frame
+  elsif task_size == 1
+    # you have as many nodes as there are tasks
+    array_id
+  elsif array_id > 1
+    start_frame + offset
   else
-    TASK_START_FRAME=$START_FRAME
-  fi
+    start_frame
+  end
+end
 
-  echo $TASK_START_FRAME
-}
+def output_end_frame
+  puts task_end_frame
+end
 
-function end_frame(){
-
-  if [ $REMAINDER -ne 0 ] && [ "$PBS_ARRAYID" -eq "$NODES" ]; then
-    # last task picks up the remainder of the frames
-    TASK_END_FRAME=$(( OFFSET + START_FRAME + REMAINDER ))
-  elif [ "$NODES" != "1" ]; then
-    TASK_END_FRAME=$(( OFFSET + START_FRAME ))
+def task_end_frame
+  if nodes == 1
+    end_frame
+  elsif task_size == 1
+    # you have as many nodes as there are tasks
+    array_id
+  elsif array_id > 1 && array_id == nodes
+    # last task gets the remaining frames
+    offset + task_size + remaining_frames
+  elsif array_id > 1
+    offset + task_size
   else
-    TASK_END_FRAME=$END_FRAME
-  fi
+    # array id == 1
+    task_size
+  end
+end
 
-  echo $TASK_END_FRAME
-}
+def array_id
+  (ENV['PBS_ARRAYID'] || 1).to_i
+end
+
+def offset
+  (array_id - 1) * task_size
+end
+
+def task_size
+  task_size = (total_frames / nodes).to_i
+  task_size.zero? ? 1 : task_size
+end
+
+def total_frames
+  # need +1 here bc we're always starting at the first frame
+  # 20 - 1 = is 20 frames, not 19. even 3-3 is 1 frame (the third)
+  end_frame - start_frame + 1
+end
+
+def nodes
+  (ENV['NODES'] || 1).to_i
+end
+
+def start_frame
+  frame = (ENV['START_FRAME'] || 1).to_i
+  frame <= 0 ? 1 : frame
+end
+
+def end_frame
+  (ENV['END_FRAME'] || 1).to_i
+end
+
+def remaining_frames
+  total_frames % nodes
+end
+
+def create_thumbnails
+  img_dir="<%= project_dir %>/images"
+  thumb_dir="<%= project_dir %>/thumbnails"
+
+  images = Dir.glob("#{img_dir}/*").keep_if do |img|
+    file_num = /\d+/.match(File.basename(img))
+    if !file_num.nil?
+      num = file_num.to_s.to_i
+      num >= task_start_frame && num <= task_end_frame
+    else
+      false
+    end
+  end
+
+  convert_args="-resize 80x80"
+  Dir.mkdir(thumb_dir) unless File.exists?(thumb_dir)
+
+  images.each do |img|
+    fname = File.basename(img, ".*")
+    puts "creating thumbnail for #{fname}"
+    system("convert #{img} #{convert_args} #{thumb_dir}/#{fname}.png")
+  end
+
+end
+UTILS
 
 echo "starting at $(date)"
 
+module purge
 #load the singularity and ACCAD modules and record the loaded module list
 module use /usr/local/share/lmodfiles/project/osc
 module load singularity/current
+module load ruby
 
 <%
   groups = OodSupport::Process.groups.map(&:name)
@@ -100,12 +156,11 @@ SKIP_EXISTING="-skipExistingFrames <%= skip_existing %>"
 export NODES=<%= nodes %>
 export START_FRAME="<%= start_frame %>"
 export END_FRAME="<%= end_frame %>"
-export TOTAL_FRAMES=$(( END_FRAME - START_FRAME ))
-export TASK_SIZE=$(( TOTAL_FRAMES / NODES ))
-export REMAINDER=$(( TOTAL_FRAMES % NODES ))
-export OFFSET=$(( PBS_ARRAYID * TASK_SIZE ))
 
-ARGS="-r $RENDERER $SKIP_EXISTING ${EXTRA_ARGS} -proj $PRJ_DIR -s $(start_frame) -e $(end_frame) $FILE"
+TASK_START_FRAME=$(ruby -r $UTIL_FILE -e output_start_frame)
+TASK_END_FRAME=$(ruby -r $UTIL_FILE -e output_end_frame)
+
+ARGS="-r $RENDERER $SKIP_EXISTING ${EXTRA_ARGS} -proj $PRJ_DIR -s $TASK_START_FRAME -e $TASK_END_FRAME $FILE"
 
 echo "executing: $CMD $ARGS"
 echo "on host: $(hostname)"
@@ -121,8 +176,7 @@ echo "ended with status $STATUS"
 
 if [ $STATUS -eq 0 ]; then
   echo "now creating thumbnails"
-  time create_thumbnails
+  ruby -r $UTIL_FILE -e create_thumbnails
 fi
-
 
 exit $STATUS
