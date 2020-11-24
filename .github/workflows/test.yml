@@ -9,7 +9,7 @@ on:
       - master
 
 jobs:
-  unit-tests:
+  tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -29,4 +29,4 @@ jobs:
       - name: install gems
         run: bundle install
       - name: test
-        run: rake test
+        run: bundle exec rake test
